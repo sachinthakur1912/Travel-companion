@@ -112,7 +112,21 @@ export class ChatService {
     userId: string,
     sendMessageDto: SendMessageDto,
   ): Promise<Message> {
-    const chat = await this.getChat(sendMessageDto.chatId, userId);
+    // Check if user has access to this chat (without loading all relations)
+    const chat = await this.chatRepository.findOne({
+      where: { id: sendMessageDto.chatId },
+    });
+
+    if (!chat) {
+      throw new NotFoundException('Chat not found');
+    }
+
+    // Check access for direct chat
+    if (chat.type === ChatType.DIRECT) {
+      if (chat.user1Id !== userId && chat.user2Id !== userId) {
+        throw new ForbiddenException('You do not have access to this chat');
+      }
+    }
 
     const message = this.messageRepository.create({
       chatId: sendMessageDto.chatId,
@@ -123,13 +137,17 @@ export class ChatService {
 
     const savedMessage = await this.messageRepository.save(message);
 
-    // Update chat's updatedAt
-    chat.updatedAt = new Date();
-    await this.chatRepository.save(chat);
+    // Update chat's updatedAt - TypeORM will handle this automatically with UpdateDateColumn
+    // But we can also manually trigger it by saving
+    await this.chatRepository.update(
+      { id: sendMessageDto.chatId },
+      { updatedAt: new Date() },
+    );
 
+    // Return message with sender relation only (no chat relation to avoid circular reference)
     const messageWithRelations = await this.messageRepository.findOne({
       where: { id: savedMessage.id },
-      relations: ['sender', 'chat'],
+      relations: ['sender'],
     });
 
     if (!messageWithRelations) {
@@ -147,6 +165,26 @@ export class ChatService {
       relations: ['sender'],
       order: { createdAt: 'ASC' },
     });
+  }
+
+  async getChatForGateway(chatId: string, userId: string): Promise<Chat> {
+    // Lightweight version without loading all relations
+    const chat = await this.chatRepository.findOne({
+      where: { id: chatId },
+    });
+
+    if (!chat) {
+      throw new NotFoundException('Chat not found');
+    }
+
+    // Check access for direct chat
+    if (chat.type === ChatType.DIRECT) {
+      if (chat.user1Id !== userId && chat.user2Id !== userId) {
+        throw new ForbiddenException('You do not have access to this chat');
+      }
+    }
+
+    return chat;
   }
 
   async markAsRead(chatId: string, userId: string): Promise<void> {

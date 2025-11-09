@@ -8,12 +8,11 @@ import {
   ConnectedSocket,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { UseGuards } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { ChatService } from './chat.service';
 import { SendMessageDto } from './dto/message.dto';
-import { ChatType } from '../entities/chat.entity';
+import { logger } from '../common/logger';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -56,10 +55,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       // Join user's personal room
       client.join(`user:${payload.sub}`);
+      
+      logger.log(`User ${payload.sub} connected via Socket.IO (socketId: ${client.id})`);
 
       // Notify user is online
       this.server.emit('user:online', { userId: payload.sub });
     } catch (error) {
+      logger.error('Socket connection error:', error);
       client.disconnect();
     }
   }
@@ -83,27 +85,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     try {
       const message = await this.chatService.sendMessage(client.userId, data);
 
-      // Get chat to determine recipients
-      const chat = await this.chatService.getChat(data.chatId, client.userId);
+      // Get chat to determine recipients (lightweight, no relations)
+      const chat = await this.chatService.getChatForGateway(data.chatId, client.userId);
 
-      // Emit to appropriate users
-      if (chat.type === ChatType.DIRECT) {
-        const otherUserId = chat.user1Id === client.userId ? chat.user2Id : chat.user1Id;
-        const otherUserSocketId = this.connectedUsers.get(otherUserId);
-        
-        if (otherUserSocketId) {
-          this.server.to(otherUserSocketId).emit('message:new', message);
-        }
-        
-        // Also emit to sender
-        client.emit('message:sent', message);
-      } else if (chat.type === ChatType.GROUP && chat.groupId) {
-        // Emit to all group members
-        this.server.to(`group:${chat.groupId}`).emit('message:new', message);
-      }
+      // Use chat rooms for reliable message delivery
+      const chatRoom = `chat:${data.chatId}`;
+      
+      // Emit to chat room (all users in the chat will receive it)
+      this.server.to(chatRoom).emit('message:new', message);
+      
+      // Also emit confirmation to sender
+      client.emit('message:sent', message);
 
       return { success: true, message };
     } catch (error) {
+      logger.error('Error sending message via gateway:', error);
       return { error: error.message };
     }
   }
@@ -117,8 +113,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return { error: 'Unauthorized' };
     }
 
-    client.join(`chat:${data.chatId}`);
-    return { success: true };
+    try {
+      const chatRoom = `chat:${data.chatId}`;
+      client.join(chatRoom);
+      
+      logger.log(`User ${client.userId} joined chat room ${chatRoom}`);
+      
+      return { success: true, room: chatRoom };
+    } catch (error) {
+      logger.error('Error joining chat room:', error);
+      return { error: 'Failed to join chat room' };
+    }
+  }
+
+  // Public method to emit to room (for HTTP API fallback)
+  emitToRoom(room: string, event: string, data: any) {
+    this.server.to(room).emit(event, data);
   }
 
   @SubscribeMessage('chat:leave')
@@ -141,6 +151,68 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     await this.chatService.markAsRead(data.chatId, client.userId);
     return { success: true };
+  }
+
+  @SubscribeMessage('typing:start')
+  async handleTypingStart(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { chatId: string },
+  ) {
+    if (!client.userId) {
+      return { error: 'Unauthorized' };
+    }
+
+    try {
+      const chatRoom = `chat:${data.chatId}`;
+      
+      // Verify client is in the room
+      const clientRooms = Array.from(client.rooms);
+      if (!clientRooms.includes(chatRoom)) {
+        client.join(chatRoom);
+      }
+      
+      // Emit to all users in chat room except sender
+      this.server.to(chatRoom).except(client.id).emit('typing:start', {
+        chatId: data.chatId,
+        userId: client.userId,
+      });
+      
+      return { success: true };
+    } catch (error) {
+      logger.error('Error handling typing:start:', error);
+      return { error: 'Failed to handle typing start' };
+    }
+  }
+
+  @SubscribeMessage('typing:stop')
+  async handleTypingStop(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { chatId: string },
+  ) {
+    if (!client.userId) {
+      return { error: 'Unauthorized' };
+    }
+
+    try {
+      const chatRoom = `chat:${data.chatId}`;
+      
+      // Verify client is in the room
+      const clientRooms = Array.from(client.rooms);
+      if (!clientRooms.includes(chatRoom)) {
+        client.join(chatRoom);
+      }
+      
+      // Emit to all users in chat room except sender
+      this.server.to(chatRoom).except(client.id).emit('typing:stop', {
+        chatId: data.chatId,
+        userId: client.userId,
+      });
+      
+      return { success: true };
+    } catch (error) {
+      logger.error('Error handling typing:stop:', error);
+      return { error: 'Failed to handle typing stop' };
+    }
   }
 }
 
